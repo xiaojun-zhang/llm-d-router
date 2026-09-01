@@ -291,7 +291,7 @@ func TestHandleResponseBodyWithoutSchedulingRequest(t *testing.T) {
 		TargetModelName:           "target-model",
 		Priority:                  3,
 		RequestReceivedTimestamp:  timeBaseline,
-		ResponseCompleteTimestamp: timeBaseline.Add(time.Second),
+		responseCompleteTimestamp: timeBaseline.Add(time.Second),
 		Response: &Response{
 			Headers: map[string]string{},
 		},
@@ -512,6 +512,59 @@ func TestGenerateResponseHeaders_Sanitization(t *testing.T) {
 	assert.NotContains(t, gotHeaders, "content-length")
 }
 
+func TestGenerateResponseHeaders_FlowQueueDuration(t *testing.T) {
+	server := &StreamingServer{}
+
+	tests := []struct {
+		name      string
+		admitted  bool
+		duration  time.Duration
+		wantValue string
+		wantEmit  bool
+	}{
+		{
+			name:     "not admitted omits header",
+			admitted: false,
+			wantEmit: false,
+		},
+		{
+			name:      "admitted with zero wait emits 0",
+			admitted:  true,
+			duration:  500 * time.Microsecond,
+			wantValue: "0",
+			wantEmit:  true,
+		},
+		{
+			name:      "admitted with measurable wait emits milliseconds",
+			admitted:  true,
+			duration:  1500 * time.Millisecond,
+			wantValue: "1500",
+			wantEmit:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reqCtx := &RequestContext{
+				FlowControlAdmitted:      tc.admitted,
+				FlowControlQueueDuration: tc.duration,
+				Response:                 &Response{Headers: map[string]string{}},
+			}
+
+			gotHeaders := make(map[string]string)
+			for _, h := range server.generateResponseHeaders(reqCtx) {
+				gotHeaders[h.Header.Key] = string(h.Header.RawValue)
+			}
+
+			if tc.wantEmit {
+				assert.Equal(t, tc.wantValue, gotHeaders[metadata.FlowQueueDurationHeaderKey])
+			} else {
+				assert.NotContains(t, gotHeaders, metadata.FlowQueueDurationHeaderKey)
+			}
+		})
+	}
+}
+
 func TestRewriteModelName(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -519,6 +572,7 @@ func TestRewriteModelName(t *testing.T) {
 		targetModel   string
 		incomingModel string
 		want          string
+		wantMutated   bool
 	}{
 		{
 			name:          "non-streaming response with model rewrite",
@@ -526,6 +580,7 @@ func TestRewriteModelName(t *testing.T) {
 			targetModel:   "vllm-backend-01",
 			incomingModel: "gpt-4-proxy",
 			want:          `{"id":"cmpl-123","model":"gpt-4-proxy","choices":[]}`,
+			wantMutated:   true,
 		},
 		{
 			name:          "streaming SSE chunk with model rewrite",
@@ -533,6 +588,7 @@ func TestRewriteModelName(t *testing.T) {
 			targetModel:   "vllm-backend-01",
 			incomingModel: "gpt-4-proxy",
 			want:          `data: {"id":"cmpl-123","model":"gpt-4-proxy","choices":[]}` + "\n\n",
+			wantMutated:   true,
 		},
 		{
 			name:          "no rewrite when names are the same",
@@ -540,6 +596,7 @@ func TestRewriteModelName(t *testing.T) {
 			targetModel:   "same-model",
 			incomingModel: "same-model",
 			want:          `{"model":"same-model"}`,
+			wantMutated:   false,
 		},
 		{
 			name:          "no rewrite when target is empty",
@@ -547,6 +604,7 @@ func TestRewriteModelName(t *testing.T) {
 			targetModel:   "",
 			incomingModel: "gpt-4-proxy",
 			want:          `{"model":"some-model"}`,
+			wantMutated:   false,
 		},
 		{
 			name:          "no rewrite when incoming is empty",
@@ -554,6 +612,7 @@ func TestRewriteModelName(t *testing.T) {
 			targetModel:   "some-model",
 			incomingModel: "",
 			want:          `{"model":"some-model"}`,
+			wantMutated:   false,
 		},
 		{
 			name:          "model field with space after colon",
@@ -561,6 +620,7 @@ func TestRewriteModelName(t *testing.T) {
 			targetModel:   "vllm-backend-01",
 			incomingModel: "gpt-4-proxy",
 			want:          `{"model": "gpt-4-proxy"}`,
+			wantMutated:   true,
 		},
 		{
 			name:          "body without model field is unchanged",
@@ -568,6 +628,7 @@ func TestRewriteModelName(t *testing.T) {
 			targetModel:   "vllm-backend-01",
 			incomingModel: "gpt-4-proxy",
 			want:          `{"id":"cmpl-123","choices":[]}`,
+			wantMutated:   false,
 		},
 		{
 			name:          "DONE marker is not affected",
@@ -575,13 +636,15 @@ func TestRewriteModelName(t *testing.T) {
 			targetModel:   "vllm-backend-01",
 			incomingModel: "gpt-4-proxy",
 			want:          "data: [DONE]\n",
+			wantMutated:   false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := rewriteModelName([]byte(tc.body), tc.targetModel, tc.incomingModel)
+			got, mutated := rewriteModelName([]byte(tc.body), tc.targetModel, tc.incomingModel)
 			assert.Equal(t, tc.want, string(got))
+			assert.Equal(t, tc.wantMutated, mutated)
 		})
 	}
 }
@@ -632,7 +695,66 @@ func TestResponseSizeAccumulation(t *testing.T) {
 				endOfStream := i == len(tt.chunks)-1
 				server.HandleResponseBody(ctx, reqCtx, chunk, endOfStream)
 			}
-			assert.Equal(t, tt.wantResponseSize, reqCtx.ResponseSize)
+			assert.Equal(t, tt.wantResponseSize, reqCtx.responseSize)
+		})
+	}
+}
+
+func TestStreamedEventAccumulation(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+
+	tests := []struct {
+		name               string
+		headers            map[string]string
+		chunks             [][]byte
+		wantStreamedEvents int
+	}{
+		{
+			name:    "events accumulate across chunks",
+			headers: map[string]string{"content-type": "text/event-stream"},
+			chunks: [][]byte{
+				[]byte(`data: {"choices":[{"text":"He"}]}` + "\n" + `data: {"choices":[{"text":"llo"}]}` + "\n"),
+				[]byte(`data: {"choices":[{"text":"!"}]}` + "\n" + `data: [DONE]`),
+			},
+			wantStreamedEvents: 3,
+		},
+		{
+			name:               "a truncated stream keeps the count it reached",
+			headers:            map[string]string{"content-type": "text/event-stream"},
+			chunks:             [][]byte{[]byte(`data: {"choices":[{"text":"He"}]}` + "\n")},
+			wantStreamedEvents: 1,
+		},
+		{
+			name:    "an event cut after the prefix at a chunk boundary counts once",
+			headers: map[string]string{"content-type": "text/event-stream"},
+			chunks: [][]byte{
+				[]byte(`data: {"choices":[{"text":"He"}]}` + "\n" + `data: {"cho`),
+				[]byte(`ices":[{"text":"llo"}]}` + "\n" + `data: [DONE]`),
+			},
+			wantStreamedEvents: 2,
+		},
+		{
+			name:               "a non-streamed response counts nothing",
+			headers:            map[string]string{"content-type": "application/json"},
+			chunks:             [][]byte{[]byte(body)},
+			wantStreamedEvents: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &StreamingServer{
+				parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+				director:       &mockDirector{},
+			}
+			reqCtx := &RequestContext{
+				Response:          &Response{Headers: tt.headers},
+				SchedulingRequest: &fwksched.InferenceRequest{FairnessID: metadata.DefaultFairnessID},
+			}
+			for i, chunk := range tt.chunks {
+				server.HandleResponseBody(ctx, reqCtx, chunk, i == len(tt.chunks)-1)
+			}
+			assert.Equal(t, tt.wantStreamedEvents, reqCtx.StreamedEvents)
 		})
 	}
 }

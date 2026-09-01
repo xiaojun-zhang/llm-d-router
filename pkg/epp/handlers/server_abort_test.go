@@ -21,6 +21,7 @@ import (
 	"errors"
 	"testing"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoyTypePb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/go-logr/logr"
@@ -80,8 +81,8 @@ func TestUpdateStateAndSendIfNeeded_Evicted(t *testing.T) {
 			logger := logr.Discard()
 
 			reqCtx := &RequestContext{
-				RequestState:         RequestEvicted,
-				RequestDroppedReason: tt.requestDroppedReason,
+				requestState:         requestEvicted,
+				requestDroppedReason: tt.requestDroppedReason,
 			}
 
 			err := reqCtx.updateStateAndSendIfNeeded(srv, logger)
@@ -115,7 +116,7 @@ func TestUpdateStateAndSendIfNeeded_NotEvicted(t *testing.T) {
 
 	// Normal state — no responses queued, nothing should be sent.
 	reqCtx := &RequestContext{
-		RequestState: RequestReceived,
+		requestState: requestReceived,
 	}
 
 	err := reqCtx.updateStateAndSendIfNeeded(srv, logger)
@@ -128,30 +129,30 @@ func TestTerminationCause(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		state  StreamRequestState
+		state  streamRequestState
 		ctxErr error
 		want   fwkrc.TerminationCause
 	}{
 		{
 			name:   "evicted outranks a cancelled context",
-			state:  RequestEvicted,
+			state:  requestEvicted,
 			ctxErr: context.Canceled,
 			want:   fwkrc.TerminationCauseEvicted,
 		},
 		{
 			name:   "a cancelled context is the client going away",
-			state:  ResponseReceived,
+			state:  responseReceived,
 			ctxErr: context.Canceled,
 			want:   fwkrc.TerminationCauseClientDisconnect,
 		},
 		{
 			name:  "anything else is an error",
-			state: ResponseReceived,
+			state: responseReceived,
 			want:  fwkrc.TerminationCauseError,
 		},
 		{
 			name:  "skipped response processing never observes completion",
-			state: RequestResponseProcessingSkipped,
+			state: requestResponseProcessingSkipped,
 			want:  fwkrc.TerminationCauseError,
 		},
 	}
@@ -159,8 +160,70 @@ func TestTerminationCause(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			reqCtx := &RequestContext{RequestState: tt.state}
+			reqCtx := &RequestContext{requestState: tt.state}
 			assert.Equal(t, tt.want, terminationCause(reqCtx, tt.ctxErr))
+		})
+	}
+}
+
+func TestTerminationCauseFromGRPCTrailers(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   string
+		useValue bool
+		want     fwkrc.TerminationCause
+	}{
+		{
+			name:   "OK",
+			status: "0",
+			want:   "",
+		},
+		{
+			name:   "internal error",
+			status: "13",
+			want:   fwkrc.TerminationCauseError,
+		},
+		{
+			name:   "cancelled",
+			status: "1",
+			want:   fwkrc.TerminationCauseError,
+		},
+		{
+			name: "missing grpc status",
+			want: "",
+		},
+		{
+			name:     "internal error from value",
+			status:   "13",
+			useValue: true,
+			want:     fwkrc.TerminationCauseError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trailers := &extProcPb.HttpTrailers{
+				Trailers: &corev3.HeaderMap{},
+			}
+
+			if tt.status != "" {
+				header := &corev3.HeaderValue{
+					Key: "grpc-status",
+				}
+				if tt.useValue {
+					header.Value = tt.status
+				} else {
+					header.RawValue = []byte(tt.status)
+				}
+
+				trailers.Trailers.Headers = []*corev3.HeaderValue{header}
+			}
+
+			assert.Equal(
+				t,
+				tt.want,
+				terminationCauseFromGRPCTrailers(trailers),
+			)
 		})
 	}
 }
